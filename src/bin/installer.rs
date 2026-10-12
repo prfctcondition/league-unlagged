@@ -285,7 +285,6 @@ struct InstallerApp {
     install_dir: String,
     create_desktop_shortcut: bool,
     create_start_menu_shortcut: bool,
-    launch_after_install: bool,
     install_completed: bool,
     installed_exe_path: Option<PathBuf>,
     status_message: Option<(bool, String)>,
@@ -312,7 +311,6 @@ impl InstallerApp {
             install_dir: default_install_dir(true),
             create_desktop_shortcut: true,
             create_start_menu_shortcut: true,
-            launch_after_install: true,
             install_completed: false,
             installed_exe_path: None,
             status_message: None,
@@ -606,17 +604,13 @@ impl InstallerApp {
                         ) {
                             Ok((exe_path, logs)) => {
                                 self.install_logs = logs;
-                                self.installed_exe_path = Some(exe_path.clone());
+                                self.installed_exe_path = Some(exe_path);
                                 self.install_completed = true;
                                 self.status_message = Some((
                                     true,
-                                    "Status: Installed v1.0.0 + Desktop Admin Shortcut"
+                                    "Status: Installed v1.0.0 — Ready to Launch"
                                         .to_string(),
                                 ));
-                                if self.launch_after_install {
-                                    let _ = launch_installed_app_as_admin(&exe_path);
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                }
                             }
                             Err(err) => {
                                 self.status_message = Some((false, err));
@@ -968,16 +962,6 @@ impl eframe::App for InstallerApp {
                             false,
                         );
                         self.create_start_menu_shortcut = start_menu;
-
-                        ui.add_space(6.0);
-                        let mut launch = self.launch_after_install;
-                        self.render_centered_toggle_row(
-                            ui,
-                            &mut launch,
-                            "Launch League Unlagged as Administrator when setup finishes",
-                            false,
-                        );
-                        self.launch_after_install = launch;
                     });
                 } else {
                     zen_card_frame(self.theme_mode, true).show(ui, |ui| {
@@ -999,6 +983,31 @@ impl eframe::App for InstallerApp {
                                     .monospace()
                                     .color(p.text_secondary),
                             );
+                        }
+                        ui.add_space(14.0);
+                        ui.label(
+                            RichText::new(
+                                "Click 'Launch League Unlagged' below to open the utility as Administrator and close this installer.",
+                            )
+                            .size(12.0)
+                            .color(p.text_body),
+                        );
+                        ui.add_space(12.0);
+                        let avail_w = ui.available_width();
+                        let (btn_row_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(avail_w, 36.0), Sense::hover());
+                        let (_, inline_launch_clicked) = self.draw_cta_button_at(
+                            ui,
+                            btn_row_rect.right(),
+                            btn_row_rect.center().y,
+                            LucideIcon::Zap,
+                            "Launch League Unlagged",
+                        );
+                        if inline_launch_clicked {
+                            if let Some(exe) = &self.installed_exe_path {
+                                let _ = launch_installed_app_as_admin(exe);
+                            }
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
                 }
@@ -1033,7 +1042,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    if ! is_admin && !export_screenshot && !args.iter().any(|a| a == "--elevated") {
+    if !is_admin && !export_screenshot && !args.iter().any(|a| a == "--elevated") {
         if relaunch_self_as_admin().is_ok() {
             return Ok(());
         }
@@ -1061,7 +1070,7 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("League Unlagged v1.0.0 — Windows Setup")
         .with_decorations(false)
-        .with_inner_size([620.0, 464.0])
+        .with_inner_size([620.0, 434.0])
         .with_resizable(false);
 
     if let Some(icon_data) = load_unlagged_window_icon() {

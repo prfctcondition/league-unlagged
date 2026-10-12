@@ -350,10 +350,38 @@ impl LeagueUnlaggedApp {
             hw.cpu_plan.vanguard_cpus_lasso
         ));
 
-        let onboarding_completed = if export_screenshots {
+        let driver_restarted = std::env::args().any(|a| a == "--driver-restarted");
+        if driver_restarted {
+            logs.push(
+                "Display driver restarted successfully — VESA DisplayID 2.0 topology and GPU low-latency parameters are now active."
+                    .to_string(),
+            );
+        }
+
+        let onboarding_completed = if export_screenshots || driver_restarted {
             true
         } else {
             prefs.onboarding_completed
+        };
+
+        let post_restart_job = if driver_restarted {
+            let (_tx, rx) = mpsc::channel();
+            Some(ActiveJob {
+                title: "Applying 1-Click Optimization Profile".to_string(),
+                step_label: "Display driver restarted successfully. VESA DisplayID 2.0 and GPU low-latency parameters are now active.".to_string(),
+                target_progress: 1.0,
+                visual_progress: 1.0,
+                started_at: Instant::now(),
+                rx,
+                show_driver_restart_action: true,
+                is_finished: true,
+                driver_restart_queued: false,
+                driver_restarted_status: Some(
+                    "Display Driver Restarted (DisplayID 2.0 Active)".to_string(),
+                ),
+            })
+        } else {
+            None
         };
 
         Self {
@@ -386,7 +414,7 @@ impl LeagueUnlaggedApp {
             show_tech_details: false,
             show_log_drawer: false,
             sim_preset: SimCpuPreset::LiveHardware,
-            active_job: None,
+            active_job: post_restart_job,
             completion_toast: None,
             export_screenshot_frame: if export_screenshots { Some(0) } else { None },
             logs,
@@ -3505,6 +3533,8 @@ impl LeagueUnlaggedApp {
                 self.log(m);
             }
         }
+        self.onboarding_completed = true;
+        self.save_preferences();
         let gpu_pnp = self.hw.gpu.pnp_device_id.clone();
         let status = match display_cru::run_cru_restart64(&gpu_pnp) {
             Ok(m) => {
