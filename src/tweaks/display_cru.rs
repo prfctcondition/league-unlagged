@@ -318,58 +318,43 @@ Expand-Archive -Path $zip -DestinationPath '{}' -Force
     }
 }
 
-/// Restarts the active display driver (`pnputil /restart-device` or `restart64.exe -q`)
-/// in a detached background helper after the current process cleanly releases its pre-reset
-/// OpenGL/DirectX render context, and automatically reopens `league-unlagged.exe --driver-restarted`
-/// as soon as the WDDM display driver finishes reloading.
+/// Restarts the active display driver (`restart64.exe -q` or `pnputil /restart-device`)
+/// directly in-place while the application remains open on the CPU software rasterizer (WARP).
 pub fn run_cru_restart64(gpu_pnp_id: &str) -> Result<String, String> {
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to locate application executable: {e}"))?;
-    let work_dir = exe_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
-
     let cru_dir = get_cru_dir();
     let restart_exe = cru_dir.join("restart64.exe");
-    let pid = std::process::id();
 
-    let exe_escaped = exe_path.display().to_string().replace('\'', "''");
-    let work_escaped = work_dir.display().to_string().replace('\'', "''");
-    let pnp_escaped = gpu_pnp_id.trim().replace('\'', "''");
-    let restart_escaped = restart_exe.display().to_string().replace('\'', "''");
+    if restart_exe.exists() {
+        let status = Command::new(&restart_exe)
+            .arg("-q")
+            .current_dir(&cru_dir)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        if let Ok(st) = status {
+            if st.success() {
+                return Ok(
+                    "Display driver restarted via restart64.exe -q (DisplayID 2.0 topology active)."
+                        .to_string(),
+                );
+            }
+        }
+    }
 
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'SilentlyContinue'
-Wait-Process -Id {pid} -Timeout 3 -ErrorAction SilentlyContinue
-$restarted = $false
-if ('{pnp_escaped}' -ne '') {{
-    $p = Start-Process -FilePath 'pnputil.exe' -ArgumentList '/restart-device', '{pnp_escaped}' -WindowStyle Hidden -Wait -PassThru
-    if ($p.ExitCode -eq 0) {{ $restarted = $true }}
-}}
-if (-not $restarted -and (Test-Path -LiteralPath '{restart_escaped}')) {{
-    Start-Process -FilePath '{restart_escaped}' -ArgumentList '-q' -WindowStyle Hidden -Wait
-}}
-Start-Sleep -Milliseconds 900
-Start-Process -FilePath '{exe_escaped}' -WorkingDirectory '{work_escaped}' -ArgumentList '--driver-restarted'
-"#
-    );
+    let trimmed_pnp = gpu_pnp_id.trim();
+    if !trimmed_pnp.is_empty() {
+        let out = Command::new("pnputil")
+            .args(["/restart-device", trimmed_pnp])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Failed to execute pnputil /restart-device: {e}"))?;
+        if out.status.success() {
+            return Ok(format!(
+                "Display driver ({trimmed_pnp}) restarted via pnputil (DisplayID 2.0 topology active)."
+            ));
+        }
+    }
 
-    Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            &script,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| format!("Failed to launch display driver restart helper: {e}"))?;
-
-    std::process::exit(0);
+    Err("Could not restart display driver automatically (reboot Windows to apply DisplayID 2.0 override).".to_string())
 }
 
 #[cfg(test)]

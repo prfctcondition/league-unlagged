@@ -263,7 +263,8 @@ pub fn read_device_irq_status(
         }
     }
 
-    let is_pinned = device_policy == 4 && current_mask == recommended_mask && msi_supported;
+    let is_pinned =
+        device_policy == 4 && current_mask != 0 && (current_mask & 1) == 0 && msi_supported;
 
     DeviceIrqStatus {
         category,

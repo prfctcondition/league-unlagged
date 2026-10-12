@@ -350,38 +350,10 @@ impl LeagueUnlaggedApp {
             hw.cpu_plan.vanguard_cpus_lasso
         ));
 
-        let driver_restarted = std::env::args().any(|a| a == "--driver-restarted");
-        if driver_restarted {
-            logs.push(
-                "Display driver restarted successfully — VESA DisplayID 2.0 topology and GPU low-latency parameters are now active."
-                    .to_string(),
-            );
-        }
-
-        let onboarding_completed = if export_screenshots || driver_restarted {
+        let onboarding_completed = if export_screenshots {
             true
         } else {
             prefs.onboarding_completed
-        };
-
-        let post_restart_job = if driver_restarted {
-            let (_tx, rx) = mpsc::channel();
-            Some(ActiveJob {
-                title: "Applying 1-Click Optimization Profile".to_string(),
-                step_label: "Display driver restarted successfully. VESA DisplayID 2.0 and GPU low-latency parameters are now active.".to_string(),
-                target_progress: 1.0,
-                visual_progress: 1.0,
-                started_at: Instant::now(),
-                rx,
-                show_driver_restart_action: true,
-                is_finished: true,
-                driver_restart_queued: false,
-                driver_restarted_status: Some(
-                    "Display Driver Restarted (DisplayID 2.0 Active)".to_string(),
-                ),
-            })
-        } else {
-            None
         };
 
         Self {
@@ -414,7 +386,7 @@ impl LeagueUnlaggedApp {
             show_tech_details: false,
             show_log_drawer: false,
             sim_preset: SimCpuPreset::LiveHardware,
-            active_job: post_restart_job,
+            active_job: None,
             completion_toast: None,
             export_screenshot_frame: if export_screenshots { Some(0) } else { None },
             logs,
@@ -484,6 +456,15 @@ impl LeagueUnlaggedApp {
             self.hw.cpu_plan.game_cpus_lasso,
             self.hw.cpu_plan.vanguard_cpus_lasso
         ));
+        let irq_was_active = self
+            .irq_state
+            .gpu_irq
+            .as_ref()
+            .map(|g| g.is_pinned_to_recommended)
+            .unwrap_or(false);
+        if irq_was_active {
+            let _ = Self::apply_interrupts_batch_sync(&self.hw, true);
+        }
         let lasso_active = self.sched_state.process_lasso_rules_applied;
         if lasso_active {
             self.spawn_background_task(
@@ -3084,15 +3065,11 @@ impl LeagueUnlaggedApp {
                         self.refresh_all_states();
                     }
 
-                    let gpu_pnp = self.hw.gpu.pnp_device_id.clone();
                     if zen_pill_button(ui, self.theme_mode, "Restart Display Driver", false)
-                        .on_hover_text("Restarts the active display driver via pnputil or restart64 to apply EDID changes immediately")
+                        .on_hover_text("Restarts the active display driver via restart64 or pnputil without closing the app")
                         .clicked()
                     {
-                        match display_cru::run_cru_restart64(&gpu_pnp) {
-                            Ok(m) => self.log(m),
-                            Err(e) => self.log(format!("[ERROR] {e}")),
-                        }
+                        let _ = self.execute_modal_display_driver_restart();
                     }
 
                     if zen_pill_button(ui, self.theme_mode, "Launch CRU (Optional)", false)
@@ -3533,8 +3510,6 @@ impl LeagueUnlaggedApp {
                 self.log(m);
             }
         }
-        self.onboarding_completed = true;
-        self.save_preferences();
         let gpu_pnp = self.hw.gpu.pnp_device_id.clone();
         let status = match display_cru::run_cru_restart64(&gpu_pnp) {
             Ok(m) => {
@@ -3546,6 +3521,10 @@ impl LeagueUnlaggedApp {
                 "DisplayID 2.0 Saved (Reboot to Apply)".to_string()
             }
         };
+        if self.one_click_cfg.interrupt_affinity {
+            let _ = Self::apply_interrupts_batch_sync(&self.hw, true);
+        }
+        self.irq_state = interrupts::InterruptsState::refresh(&self.hw);
         self.cru_state = display_cru::DisplayCruState::refresh();
         status
     }
@@ -3620,7 +3599,7 @@ impl LeagueUnlaggedApp {
                     job.target_progress = 1.0;
                     job.visual_progress = 1.0;
                     job.step_label =
-                        "All optimizations applied. Restart display driver to activate CRU DisplayID 2.0 & GPU changes."
+                        "All optimizations applied. Restart display driver or reboot Windows to finalize all kernel policies."
                             .to_string();
                     if let Some(st) = auto_status {
                         job.driver_restarted_status = Some(st);
@@ -3635,12 +3614,13 @@ impl LeagueUnlaggedApp {
     }
 
     /// Renders a 60 FPS animated vector progress modal while a background tweak task is running,
-    /// including an inline CRU / DisplayID 2.0 Display Driver Restart button during 1-Click Optimization.
+    /// including an inline CRU / DisplayID 2.0 Display Driver Restart button and System Reboot prompt.
     fn render_active_job_overlay(&mut self, ctx: &Context) {
         let p = self.theme_mode.palette();
         let screen_rect = ctx.screen_rect();
 
         let mut click_restart_driver = false;
+        let mut click_reboot_system = false;
         let mut click_close_modal = false;
 
         if let Some(job) = &self.active_job {
@@ -3659,9 +3639,15 @@ impl LeagueUnlaggedApp {
             painter.rect_filled(screen_rect, Rounding::ZERO, backdrop_col);
 
             let has_driver_bar = job.show_driver_restart_action;
-            let card_w = if has_driver_bar { 520.0_f32 } else { 450.0_f32 }
+            let card_w = if has_driver_bar { 540.0_f32 } else { 450.0_f32 }
                 .min(screen_rect.width() - 40.0);
-            let card_h = if has_driver_bar { 188.0_f32 } else { 132.0_f32 };
+            let card_h = if has_driver_bar && job.is_finished {
+                238.0_f32
+            } else if has_driver_bar {
+                184.0_f32
+            } else {
+                132.0_f32
+            };
             let card_rect =
                 egui::Rect::from_center_size(screen_rect.center(), Vec2::new(card_w, card_h));
 
@@ -3685,7 +3671,7 @@ impl LeagueUnlaggedApp {
                 ),
             );
 
-            // Animated dual-arc vector spinner (or Emerald Checkmark when finished at 100%)
+            // Animated vector spinner (or Emerald Checkmark when finished at 100%)
             let spinner_center = pos2(card_rect.left() + 42.0, card_rect.top() + 46.0);
             let spinner_radius = 15.5_f32;
             if job.is_finished {
@@ -3736,12 +3722,6 @@ impl LeagueUnlaggedApp {
                 for pair in pts.windows(2) {
                     painter.line_segment([pair[0], pair[1]], Stroke::new(2.8_f32, p.gold_priority));
                 }
-                let inner_angle = -time * 3.2;
-                let dot_pos = pos2(
-                    spinner_center.x + (spinner_radius * 0.52) * inner_angle.cos(),
-                    spinner_center.y + (spinner_radius * 0.52) * inner_angle.sin(),
-                );
-                painter.circle_filled(dot_pos, 3.0, p.emerald_optimal);
             }
 
             // Title & live percentage
@@ -3835,9 +3815,9 @@ impl LeagueUnlaggedApp {
                 );
             }
 
-            // Inline CRU / DisplayID 2.0 Display Driver Restart Action Row inside the progress modal
+            // Inline CRU / DisplayID 2.0 Display Driver Restart & System Reboot rows
             if has_driver_bar {
-                let div_y = card_rect.top() + 120.0;
+                let div_y = card_rect.top() + 118.0;
                 painter.line_segment(
                     [
                         pos2(card_rect.left() + 20.0, div_y),
@@ -3846,9 +3826,20 @@ impl LeagueUnlaggedApp {
                     Stroke::new(1.0_f32, p.border_subtle),
                 );
 
+                if job.is_finished {
+                    let div2_y = card_rect.top() + 174.0;
+                    painter.line_segment(
+                        [
+                            pos2(card_rect.left() + 20.0, div2_y),
+                            pos2(card_rect.right() - 20.0, div2_y),
+                        ],
+                        Stroke::new(1.0_f32, p.border_subtle),
+                    );
+                }
+
                 let action_rect = egui::Rect::from_min_max(
-                    pos2(card_rect.left() + 22.0, div_y + 12.0),
-                    pos2(card_rect.right() - 22.0, card_rect.bottom() - 12.0),
+                    pos2(card_rect.left() + 22.0, div_y + 10.0),
+                    pos2(card_rect.right() - 22.0, card_rect.bottom() - 10.0),
                 );
                 let is_done = job.is_finished;
                 let is_queued = job.driver_restart_queued;
@@ -3860,49 +3851,87 @@ impl LeagueUnlaggedApp {
                     .show(ctx, |ui| {
                         ui.set_min_size(action_rect.size());
                         ui.set_max_size(action_rect.size());
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            draw_lucide_icon(ui, LucideIcon::Monitor, 15.0, p.text_heading);
-                            let left_note = if let Some(st) = &restarted_status {
-                                st.as_str()
-                            } else {
-                                "CRU / DisplayID 2.0 Block:"
-                            };
-                            ui.label(
-                                RichText::new(left_note)
-                                    .size(11.8)
-                                    .strong()
-                                    .color(if restarted_status.is_some() {
-                                        p.emerald_optimal
-                                    } else {
-                                        p.text_body
-                                    }),
-                            );
-
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                if is_done {
-                                    if zen_pill_button(ui, self.theme_mode, "Close", false).clicked()
-                                    {
-                                        click_close_modal = true;
-                                    }
-                                }
-
-                                let (btn_icon, btn_label) = if restarted_status.is_some() {
-                                    (LucideIcon::Check, "Restart Display Driver Again")
-                                } else if is_queued && !is_done {
-                                    (LucideIcon::RotateCcw, "Driver Restart Queued (100%)")
+                        ui.vertical(|ui| {
+                            // Row 1: CRU / DisplayID 2.0 Display Driver Restart
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                draw_lucide_icon(ui, LucideIcon::Monitor, 15.0, p.text_heading);
+                                let left_note = if let Some(st) = &restarted_status {
+                                    st.as_str()
                                 } else {
-                                    (LucideIcon::RotateCcw, "Restart Display Driver (CRU)")
+                                    "CRU / DisplayID 2.0 Block:"
                                 };
+                                ui.label(
+                                    RichText::new(left_note)
+                                        .size(11.8)
+                                        .strong()
+                                        .color(if restarted_status.is_some() {
+                                            p.emerald_optimal
+                                        } else {
+                                            p.text_body
+                                        }),
+                                );
 
-                                if zen_cta_button(ui, self.theme_mode, Some(btn_icon), btn_label)
-                                    .on_hover_text("Applies the VESA DisplayID 2.0 (CRU 1x1 Tiled Topology) block and immediately restarts the display driver via restart64 / pnputil.")
-                                    .clicked()
-                                {
-                                    click_restart_driver = true;
-                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let (btn_icon, btn_label) = if restarted_status.is_some() {
+                                        (LucideIcon::Check, "Restart Display Driver Again")
+                                    } else if is_queued && !is_done {
+                                        (LucideIcon::RotateCcw, "Driver Restart Queued (100%)")
+                                    } else {
+                                        (LucideIcon::RotateCcw, "Restart Display Driver (CRU)")
+                                    };
+
+                                    if zen_cta_button(ui, self.theme_mode, Some(btn_icon), btn_label)
+                                        .on_hover_text("Applies the VESA DisplayID 2.0 (CRU 1x1 Tiled Topology) block and immediately restarts the display driver without closing the app.")
+                                        .clicked()
+                                    {
+                                        click_restart_driver = true;
+                                    }
+                                });
                             });
+
+                            // Row 2 (shown when 1-Click completes): Recommend System Reboot
+                            if is_done {
+                                ui.add_space(18.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    draw_lucide_icon(
+                                        ui,
+                                        LucideIcon::Shield,
+                                        15.0,
+                                        p.emerald_optimal,
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "Reboot Windows to activate MSI Interrupts & HAGS:",
+                                        )
+                                        .size(11.8)
+                                        .color(p.text_secondary),
+                                    );
+
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        if zen_pill_button(ui, self.theme_mode, "Later / Close", false)
+                                            .clicked()
+                                        {
+                                            click_close_modal = true;
+                                        }
+                                        if zen_cta_button(
+                                            ui,
+                                            self.theme_mode,
+                                            Some(LucideIcon::RotateCcw),
+                                            "Restart System Now",
+                                        )
+                                        .on_hover_text(
+                                            "Reboots Windows in 5 seconds so MSI Mode, Interrupt Affinity, and HAGS registry policies take full kernel effect.",
+                                        )
+                                        .clicked()
+                                        {
+                                            click_reboot_system = true;
+                                        }
+                                    });
+                                });
+                            }
                         });
                     });
             }
@@ -3968,6 +3997,22 @@ impl LeagueUnlaggedApp {
             } else if let Some(job) = &mut self.active_job {
                 job.driver_restart_queued = true;
             }
+        }
+
+        if click_reboot_system {
+            use std::os::windows::process::CommandExt;
+            self.log("Initiating Windows reboot in 5 seconds to finalize hardware interrupt & registry policies...");
+            let _ = std::process::Command::new("shutdown")
+                .args([
+                    "/r",
+                    "/t",
+                    "5",
+                    "/c",
+                    "League Unlagged: Rebooting to apply MSI Interrupts & Kernel policies",
+                ])
+                .creation_flags(crate::hardware::CREATE_NO_WINDOW)
+                .spawn();
+            self.active_job = None;
         }
 
         if click_close_modal {

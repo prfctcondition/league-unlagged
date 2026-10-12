@@ -15,7 +15,7 @@ name = "League-Unlagged-Windows-installer"
 path = "src/bin/installer.rs"
 
 [dependencies]
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "wgpu"] }
 egui = "0.29"
 winreg = "0.52"
 serde = { version = "1.0", features = ["derive"] }
@@ -34,3 +34,7 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[patch.crates-io]
+egui-wgpu = { path = "vendor/egui-wgpu" }
+
