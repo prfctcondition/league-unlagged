@@ -4,7 +4,6 @@
 
 use crate::hardware::{GpuInfo, CREATE_NO_WINDOW};
 use crate::tweaks::scheduler::is_running_as_admin;
-use std::ffi::c_void;
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -222,7 +221,7 @@ pub fn set_amd_deep_sleep_disabled(
 
 /// Applies AMD Radeon Anti-Lag via established KMD/UMD/DXC registry keys (`KMD_DeLagEnabled`,
 /// `UMD\AntiLag_DevMode`, `UMD\Dlg_PFEnable`, `UMD\DXC\AllowDelag`) across all validated AMD
-/// display driver instances, and synchronizes live driver state via `atiadlxx.dll` (`ADL2_DELAG_SettingsX4_Set`).
+/// display driver instances.
 pub fn set_amd_antilag(preferred_subkey: &str, enable: bool) -> Result<String, String> {
     let subkeys = require_admin_and_amd_subkeys(preferred_subkey)?;
     let val: u32 = if enable { 1 } else { 0 };
@@ -270,11 +269,8 @@ pub fn set_amd_antilag(preferred_subkey: &str, enable: bool) -> Result<String, S
         }
     }
 
-    let adl_synced = sync_amd_adl2_delag_live(enable);
-
     Ok(format!(
-        "AMD Radeon Anti-Lag (KMD_DeLagEnabled={val}, UMD\\AntiLag_DevMode={str_val}, DXC\\AllowDelag={val}{}) on [{}] -> {}",
-        if adl_synced { ", ADL2 Runtime Synced" } else { "" },
+        "AMD Radeon Anti-Lag (KMD_DeLagEnabled={val}, UMD\\AntiLag_DevMode={str_val}, DXC\\AllowDelag={val}) on [{}] -> {}",
         subkeys.join(", "),
         if enable {
             "Status: Active"
@@ -282,80 +278,6 @@ pub fn set_amd_antilag(preferred_subkey: &str, enable: bool) -> Result<String, S
             "Status: Disabled"
         }
     ))
-}
-
-unsafe extern "C" fn adl_malloc_callback(size: i32) -> *mut c_void {
-    if size <= 0 {
-        return std::ptr::null_mut();
-    }
-    let layout = match std::alloc::Layout::from_size_align(size as usize, 8) {
-        Ok(l) => l,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    std::alloc::alloc(layout) as *mut c_void
-}
-
-/// Synchronizes the live AMD display driver Anti-Lag state via `atiadlxx.dll` (`ADL2_DELAG_SettingsX4_Set`)
-/// when the AMD Display Library is present on the host system.
-fn sync_amd_adl2_delag_live(enable: bool) -> bool {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn LoadLibraryA(lp_lib_file_name: *const u8) -> *mut c_void;
-        fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *mut c_void;
-        fn FreeLibrary(h_lib_module: *mut c_void) -> i32;
-    }
-
-    type AdlMainControlCreateFn = unsafe extern "C" fn(
-        callback: unsafe extern "C" fn(i32) -> *mut c_void,
-        enum_connected_adapters: i32,
-        context: *mut *mut c_void,
-    ) -> i32;
-    type AdlMainControlDestroyFn = unsafe extern "C" fn(context: *mut c_void) -> i32;
-    type AdlDelagSettingsX4GetFn =
-        unsafe extern "C" fn(context: *mut c_void, adapter_index: i32, buf: *mut i32) -> i32;
-    type AdlDelagSettingsX4SetFn =
-        unsafe extern "C" fn(context: *mut c_void, adapter_index: i32, buf: *mut i32) -> i32;
-
-    unsafe {
-        let h_mod = LoadLibraryA(b"atiadlxx.dll\0".as_ptr());
-        if h_mod.is_null() {
-            return false;
-        }
-
-        let mut updated_any = false;
-        let create_ptr = GetProcAddress(h_mod, b"ADL2_Main_Control_Create\0".as_ptr());
-        let destroy_ptr = GetProcAddress(h_mod, b"ADL2_Main_Control_Destroy\0".as_ptr());
-        let get_ptr = GetProcAddress(h_mod, b"ADL2_DELAG_SettingsX4_Get\0".as_ptr());
-        let set_ptr = GetProcAddress(h_mod, b"ADL2_DELAG_SettingsX4_Set\0".as_ptr());
-
-        if !create_ptr.is_null()
-            && !destroy_ptr.is_null()
-            && !get_ptr.is_null()
-            && !set_ptr.is_null()
-        {
-            let create: AdlMainControlCreateFn = std::mem::transmute(create_ptr);
-            let destroy: AdlMainControlDestroyFn = std::mem::transmute(destroy_ptr);
-            let get_delag: AdlDelagSettingsX4GetFn = std::mem::transmute(get_ptr);
-            let set_delag: AdlDelagSettingsX4SetFn = std::mem::transmute(set_ptr);
-
-            let mut ctx: *mut c_void = std::ptr::null_mut();
-            if create(adl_malloc_callback, 1, &mut ctx) == 0 && !ctx.is_null() {
-                for adapter_idx in 0..12 {
-                    let mut buf = [0i32; 16];
-                    if get_delag(ctx, adapter_idx, buf.as_mut_ptr()) == 0 {
-                        buf[1] = if enable { 1 } else { 0 };
-                        if set_delag(ctx, adapter_idx, buf.as_mut_ptr()) == 0 {
-                            updated_any = true;
-                        }
-                    }
-                }
-                let _ = destroy(ctx);
-            }
-        }
-
-        let _ = FreeLibrary(h_mod);
-        updated_any
-    }
 }
 
 pub fn set_amd_shader_cache_always_on(
@@ -459,6 +381,11 @@ pub fn restore_amd_driver_defaults(preferred_subkey: &str) -> Result<String, Str
 }
 
 fn get_tools_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("tools");
+        }
+    }
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("tools")

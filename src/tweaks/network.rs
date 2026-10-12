@@ -219,3 +219,63 @@ Restart-NetAdapter -Name '{}'
         }
     ))
 }
+
+/// Applies all 1-Click network stack optimizations (UDP URO Disabled, NIC Interrupt Moderation Disabled,
+/// and Energy-Efficient Ethernet Disabled) and performs a single `Restart-NetAdapter` at the very end
+/// instead of restarting the adapter multiple times.
+pub fn apply_network_stack_batch(adapter_name: &str, disable: bool) -> Vec<String> {
+    let mut logs = Vec::new();
+    match set_uro_disabled(disable) {
+        Ok(m) => logs.push(m),
+        Err(e) => logs.push(format!("[ERROR] {e}")),
+    }
+
+    if !is_running_as_admin() {
+        logs.push(
+            "[ERROR] Administrator privileges required to modify network adapter driver properties."
+                .to_string(),
+        );
+        return logs;
+    }
+    if adapter_name.trim().is_empty() {
+        return logs;
+    }
+
+    let val = if disable { "0" } else { "1" };
+    let escaped_name = adapter_name.replace('\'', "''");
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Set-NetAdapterAdvancedProperty -Name '{escaped_name}' -RegistryKeyword '*InterruptModeration' -RegistryValue {val} -NoRestart
+foreach ($kw in @('*EEE', 'AdvancedEEE', 'EnableGreenEthernet', 'PowerSavingMode')) {{
+    Set-NetAdapterAdvancedProperty -Name '{escaped_name}' -RegistryKeyword $kw -RegistryValue {val} -NoRestart
+}}
+Restart-NetAdapter -Name '{escaped_name}'
+"#
+    );
+
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    match out {
+        Ok(_) => {
+            logs.push(format!(
+                "NIC ({adapter_name}): Interrupt Moderation & Energy-Efficient Ethernet (EEE) -> {}",
+                if disable {
+                    "Status: Disabled (0, Single Adapter Reload Completed)"
+                } else {
+                    "Status: Enabled (1)"
+                }
+            ));
+        }
+        Err(e) => {
+            logs.push(format!(
+                "[ERROR] Failed to update network adapter properties on {adapter_name}: {e}"
+            ));
+        }
+    }
+
+    logs
+}

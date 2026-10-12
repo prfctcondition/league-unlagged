@@ -520,10 +520,15 @@ impl LeagueUnlaggedApp {
 
         std::thread::spawn(move || {
             let started = Instant::now();
-            let logs = task_fn(&tx, &hw_clone);
+            let logs = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                task_fn(&tx, &hw_clone)
+            })) {
+                Ok(l) => l,
+                Err(_) => vec!["[ERROR] Background worker encountered an unexpected panic and recovered safely.".to_string()],
+            };
             let _ = tx.send(WorkerEvent::Step {
                 step_label: "Verifying hardware & registry configuration...".to_string(),
-                progress: 0.88,
+                progress: 0.95,
                 log_line: None,
             });
             let states = RefreshedStates::collect(&hw_clone);
@@ -951,14 +956,28 @@ impl LeagueUnlaggedApp {
 
         self.spawn_background_task(
             "Applying 1-Click Optimization Profile",
-            "Configuring Windows Game Mode, DX Flip Model & MMCSS...",
+            "Checking required external utilities (Process Lasso / Driver Tools)...",
             move |tx, hw| {
                 let mut logs = vec!["=== Executing 1-Click Hardware Optimization Profile ===".to_string()];
 
+                // 1. Pre-flight: Download & install any required external utilities FIRST while network is untouched
+                if cfg.vanguard_and_client_isolation && !scheduler::is_process_lasso_installed() {
+                    let _ = tx.send(WorkerEvent::Step {
+                        step_label: "Downloading & installing Process Lasso via winget...".to_string(),
+                        progress: 0.10,
+                        log_line: None,
+                    });
+                    match scheduler::install_process_lasso_via_winget() {
+                        Ok(m) => logs.push(m),
+                        Err(e) => logs.push(format!("[INFO] {e}")),
+                    }
+                }
+
+                // 2. Windows Core, DirectX Flip Model, HAGS & MMCSS
                 if cfg.windows_game_and_dx {
                     let _ = tx.send(WorkerEvent::Step {
                         step_label: "Configuring Windows Game Mode, DX Flip Model & MMCSS...".to_string(),
-                        progress: 0.15,
+                        progress: 0.22,
                         log_line: None,
                     });
                     for res in [
@@ -976,10 +995,11 @@ impl LeagueUnlaggedApp {
                     }
                 }
 
+                // 3. CPU Short-Thread Policy & PCIe/USB Power Management
                 if cfg.cpu_scheduler_and_power {
                     let _ = tx.send(WorkerEvent::Step {
                         step_label: "Applying CPU Short-Thread Policy & PCIe/USB Power Rules...".to_string(),
-                        progress: 0.30,
+                        progress: 0.36,
                         log_line: None,
                     });
                     for res in [
@@ -993,10 +1013,11 @@ impl LeagueUnlaggedApp {
                     }
                 }
 
+                // 4. Process Lasso CPU Affinity & Vanguard Isolation
                 if cfg.vanguard_and_client_isolation {
                     let _ = tx.send(WorkerEvent::Step {
                         step_label: "Applying Process Lasso CPU Affinity & Vanguard Isolation...".to_string(),
-                        progress: 0.48,
+                        progress: 0.50,
                         log_line: None,
                     });
                     for res in [
@@ -1010,36 +1031,11 @@ impl LeagueUnlaggedApp {
                     }
                 }
 
-                if cfg.interrupt_affinity {
-                    let _ = tx.send(WorkerEvent::Step {
-                        step_label: "Configuring MSI Mode & Interrupt Affinity (GPU/USB/NVMe/NIC)...".to_string(),
-                        progress: 0.64,
-                        log_line: None,
-                    });
-                    logs.extend(Self::apply_interrupts_batch_sync(hw, true));
-                }
-
-                if cfg.network_stack {
-                    let _ = tx.send(WorkerEvent::Step {
-                        step_label: "Optimizing Network Stack (URO Disabled & NIC Moderation)...".to_string(),
-                        progress: 0.76,
-                        log_line: None,
-                    });
-                    match network::set_uro_disabled(true) {
-                        Ok(m) => logs.push(m),
-                        Err(e) => logs.push(format!("[ERROR] {e}")),
-                    }
-                    match network::set_nic_interrupt_moderation_disabled(&hw.nic.name, true) {
-                        Ok(m) => logs.push(m),
-                        Err(e) => logs.push(format!("[ERROR] {e}")),
-                    }
-                    let _ = network::set_nic_green_ethernet_disabled(&hw.nic.name, true);
-                }
-
+                // 5. GPU Driver Low-Latency Parameters (runs before Network Stack in case NVIDIA Profile Inspector is downloaded)
                 if cfg.gpu_driver_tweaks {
                     let _ = tx.send(WorkerEvent::Step {
                         step_label: "Applying GPU Driver Low-Latency Parameters...".to_string(),
-                        progress: 0.84,
+                        progress: 0.64,
                         log_line: None,
                     });
                     if hw.gpu.vendor == GpuVendor::Amd {
@@ -1051,8 +1047,9 @@ impl LeagueUnlaggedApp {
                             gpu::set_amd_shader_cache_always_on(sub, true),
                             gpu::set_amd_flip_queue_size_1(sub, true),
                         ] {
-                            if let Ok(m) = res {
-                                logs.push(m);
+                            match res {
+                                Ok(m) => logs.push(m),
+                                Err(e) => logs.push(format!("[ERROR] {e}")),
                             }
                         }
                     } else if hw.gpu.vendor == GpuVendor::Nvidia {
@@ -1062,6 +1059,17 @@ impl LeagueUnlaggedApp {
                     }
                 }
 
+                // 6. MSI Mode & Interrupt Affinity
+                if cfg.interrupt_affinity {
+                    let _ = tx.send(WorkerEvent::Step {
+                        step_label: "Configuring MSI Mode & Interrupt Affinity (GPU/USB/NVMe/NIC)...".to_string(),
+                        progress: 0.78,
+                        log_line: None,
+                    });
+                    logs.extend(Self::apply_interrupts_batch_sync(hw, true));
+                }
+
+                // 7. Optional Kernel Timer & DisplayID 2.0 Topology Override
                 if cfg.timer_resolution_505 {
                     let _ = windows_reg::set_global_timer_resolution_requests(true);
                     if let Ok(m) = scheduler::set_kernel_timer_resolution(true, timer_desired) {
@@ -1077,6 +1085,16 @@ impl LeagueUnlaggedApp {
                         Ok(m) => logs.push(m),
                         Err(e) => logs.push(format!("[ERROR] {e}")),
                     }
+                }
+
+                // 8. Network Stack (URO Disabled, Interrupt Moderation & EEE) — executed LAST with a single adapter restart
+                if cfg.network_stack {
+                    let _ = tx.send(WorkerEvent::Step {
+                        step_label: "Optimizing Network Stack (URO Disabled & NIC Moderation)...".to_string(),
+                        progress: 0.90,
+                        log_line: None,
+                    });
+                    logs.extend(network::apply_network_stack_batch(&hw.nic.name, true));
                 }
 
                 logs
