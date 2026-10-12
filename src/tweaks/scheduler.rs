@@ -9,6 +9,13 @@ use std::process::Command;
 use winreg::enums::*;
 use winreg::RegKey;
 
+#[repr(C)]
+struct ProcessPowerThrottlingState {
+    version: u32,
+    control_mask: u32,
+    state_mask: u32,
+}
+
 #[link(name = "ntdll")]
 extern "system" {
     fn NtQueryTimerResolution(
@@ -21,6 +28,51 @@ extern "system" {
         set_resolution: u8,
         current_resolution: *mut u32,
     ) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    fn SetProcessInformation(
+        h_process: *mut std::ffi::c_void,
+        process_information_class: i32,
+        process_information: *const std::ffi::c_void,
+        process_information_size: u32,
+    ) -> i32;
+}
+
+/// Disables Windows 11 `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` (0x4) and EcoQoS (0x1)
+/// on the current process so the Windows 11 kernel always honors `NtSetTimerResolution` even when
+/// minimized or running as a background daemon.
+pub fn disable_timer_resolution_throttling() {
+    unsafe {
+        let state = ProcessPowerThrottlingState {
+            version: 1,
+            control_mask: 0x1 | 0x4,
+            state_mask: 0,
+        };
+        let _ = SetProcessInformation(
+            GetCurrentProcess(),
+            4, // ProcessPowerThrottling
+            &state as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<ProcessPowerThrottlingState>() as u32,
+        );
+    }
+}
+
+pub fn is_timer_daemon_enabled() -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(run_key) = hkcu.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        KEY_READ,
+    ) {
+        if let Ok(val) = run_key.get_value::<String, _>("LeagueUnlaggedTimerDaemon") {
+            if !val.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +95,14 @@ impl SchedulerState {
         let ifeo_priorities_applied = check_ifeo_priorities_applied();
         let process_lasso_installed = is_process_lasso_installed();
         let process_lasso_rules_applied = check_process_lasso_rules_applied(plan);
+
+        if is_timer_daemon_enabled() {
+            disable_timer_resolution_throttling();
+            unsafe {
+                let mut cur = 0u32;
+                let _ = NtSetTimerResolution(5050, 1, &mut cur);
+            }
+        }
         let current_timer_resolution_100ns = query_current_timer_resolution_100ns();
 
         Self {
@@ -67,17 +127,108 @@ pub fn query_current_timer_resolution_100ns() -> u32 {
     }
 }
 
-/// Sets the Windows kernel timer resolution via `ntdll!NtSetTimerResolution`.
-/// `desired_100ns`: e.g. `5050` = `0.505ms` or `5000` = `0.500ms`.
+/// Runs the built-in zero-CPU background timer holder (`league-unlagged.exe --timer-daemon <100ns>`).
+/// Holds `NtSetTimerResolution` open in the background even when the main GUI is closed, until
+/// signaled via `Local\LeagueUnlagged_TimerDaemon_Stop_v1`.
+pub fn run_timer_daemon_loop(desired_100ns: u32) {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, CreateMutexW, ResetEvent, WaitForSingleObject, INFINITE,
+    };
+
+    let mutex_name: Vec<u16> = "Local\\LeagueUnlagged_TimerDaemon_Mutex_v1\0"
+        .encode_utf16()
+        .collect();
+    let mutex_handle = unsafe { CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr()) };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        return;
+    }
+
+    let event_name: Vec<u16> = "Local\\LeagueUnlagged_TimerDaemon_Stop_v1\0"
+        .encode_utf16()
+        .collect();
+    let stop_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, event_name.as_ptr()) };
+    if !stop_event.is_null() {
+        unsafe {
+            ResetEvent(stop_event);
+        }
+    }
+
+    disable_timer_resolution_throttling();
+    unsafe {
+        let mut cur = 0u32;
+        let _ = NtSetTimerResolution(desired_100ns, 1, &mut cur);
+    }
+
+    if !stop_event.is_null() {
+        unsafe {
+            WaitForSingleObject(stop_event, INFINITE);
+            CloseHandle(stop_event);
+        }
+    }
+
+    unsafe {
+        let mut cur = 0u32;
+        let _ = NtSetTimerResolution(desired_100ns, 0, &mut cur);
+        if !mutex_handle.is_null() {
+            CloseHandle(mutex_handle);
+        }
+    }
+}
+
+/// Sets the Windows kernel timer resolution via `ntdll!NtSetTimerResolution`, disables Windows 11
+/// `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION`, and manages the persistent zero-CPU
+/// background daemon (`--timer-daemon`) so the 0.5ms quantum stays locked even after closing the GUI.
 pub fn set_kernel_timer_resolution(enable: bool, desired_100ns: u32) -> Result<String, String> {
+    disable_timer_resolution_throttling();
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if enable {
+        let _ = crate::tweaks::windows_reg::set_global_timer_resolution_requests(true);
+        if let Ok(exe) = std::env::current_exe() {
+            if let Ok((run_key, _)) =
+                hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+            {
+                let cmd_val = format!("\"{}\" --timer-daemon {}", exe.display(), desired_100ns);
+                let _ = run_key.set_value("LeagueUnlaggedTimerDaemon", &cmd_val);
+            }
+            let _ = Command::new(&exe)
+                .args(["--timer-daemon", &desired_100ns.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+    } else {
+        if let Ok((run_key, _)) =
+            hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        {
+            let _ = run_key.delete_value("LeagueUnlaggedTimerDaemon");
+        }
+        unsafe {
+            let event_name: Vec<u16> = "Local\\LeagueUnlagged_TimerDaemon_Stop_v1\0"
+                .encode_utf16()
+                .collect();
+            let ev = windows_sys::Win32::System::Threading::CreateEventW(
+                std::ptr::null(),
+                1,
+                0,
+                event_name.as_ptr(),
+            );
+            if !ev.is_null() {
+                windows_sys::Win32::System::Threading::SetEvent(ev);
+                windows_sys::Win32::Foundation::CloseHandle(ev);
+            }
+        }
+    }
+
     unsafe {
         let mut current = 0u32;
         let status = NtSetTimerResolution(desired_100ns, if enable { 1 } else { 0 }, &mut current);
         if status == 0 {
+            let effective_cur = query_current_timer_resolution_100ns();
             Ok(format!(
-                "Kernel Timer Resolution (NtSetTimerResolution) -> {:.3} ms ({} * 100ns)",
-                current as f64 / 10_000.0,
-                current
+                "Kernel Timer Resolution (NtSetTimerResolution + Background Daemon) -> {:.3} ms ({} * 100ns)",
+                effective_cur as f64 / 10_000.0,
+                effective_cur
             ))
         } else {
             Err(format!(
