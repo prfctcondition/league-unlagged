@@ -984,31 +984,14 @@ impl eframe::App for InstallerApp {
                                     .color(p.text_secondary),
                             );
                         }
-                        ui.add_space(14.0);
+                        ui.add_space(12.0);
                         ui.label(
                             RichText::new(
-                                "Click 'Launch League Unlagged' below to open the utility as Administrator and close this installer.",
+                                "Click 'Launch League Unlagged' in the bottom bar to open the utility as Administrator.",
                             )
                             .size(12.0)
                             .color(p.text_body),
                         );
-                        ui.add_space(12.0);
-                        let avail_w = ui.available_width();
-                        let (btn_row_rect, _) =
-                            ui.allocate_exact_size(Vec2::new(avail_w, 36.0), Sense::hover());
-                        let (_, inline_launch_clicked) = self.draw_cta_button_at(
-                            ui,
-                            btn_row_rect.right(),
-                            btn_row_rect.center().y,
-                            LucideIcon::Zap,
-                            "Launch League Unlagged",
-                        );
-                        if inline_launch_clicked {
-                            if let Some(exe) = &self.installed_exe_path {
-                                let _ = launch_installed_app_as_admin(exe);
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
                     });
                 }
             });
