@@ -32,6 +32,11 @@ impl DisplayCruState {
 }
 
 pub fn get_cru_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("tools").join("cru");
+        }
+    }
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("tools")

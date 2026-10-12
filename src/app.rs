@@ -126,6 +126,10 @@ pub struct ActiveJob {
     pub visual_progress: f32,
     pub started_at: Instant,
     pub rx: Receiver<WorkerEvent>,
+    pub show_driver_restart_action: bool,
+    pub is_finished: bool,
+    pub driver_restart_queued: bool,
+    pub driver_restarted_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,8 +192,8 @@ impl SimCpuPreset {
 }
 
 /// Configuration profile for the 1-Click Optimization action.
-/// Hardware-safe tweaks are enabled by default; kernel timer overrides (0.505 ms)
-/// and monitor EDID overrides are disabled by default unless explicitly selected.
+/// Hardware-safe tweaks and VESA DisplayID 2.0 Tiled Topology are enabled by default;
+/// kernel timer overrides (0.505 ms) are disabled by default unless explicitly selected.
 #[derive(Debug, Clone)]
 pub struct OneClickConfig {
     pub windows_game_and_dx: bool,
@@ -200,7 +204,7 @@ pub struct OneClickConfig {
     pub gpu_driver_tweaks: bool,
     /// Disabled by default so 1-Click does not alter global kernel timer resolution unless requested.
     pub timer_resolution_505: bool,
-    /// Disabled by default (writes monitor EDID_OVERRIDE).
+    /// Writes VESA DisplayID 2.0 Tiled Topology block to monitor EDID_OVERRIDE.
     pub displayid_topology_override: bool,
 }
 
@@ -214,7 +218,7 @@ impl Default for OneClickConfig {
             network_stack: true,
             gpu_driver_tweaks: true,
             timer_resolution_505: false,
-            displayid_topology_override: false,
+            displayid_topology_override: true,
         }
     }
 }
@@ -550,6 +554,10 @@ impl LeagueUnlaggedApp {
             visual_progress: 0.06,
             started_at: Instant::now(),
             rx,
+            show_driver_restart_action: false,
+            is_finished: false,
+            driver_restart_queued: false,
+            driver_restarted_status: None,
         });
     }
 
@@ -1100,6 +1108,9 @@ impl LeagueUnlaggedApp {
                 logs
             },
         );
+        if let Some(job) = &mut self.active_job {
+            job.show_driver_restart_action = true;
+        }
     }
 
     fn disable_all_tweaks(&mut self) {
@@ -3488,6 +3499,27 @@ impl LeagueUnlaggedApp {
             });
     }
 
+    fn execute_modal_display_driver_restart(&mut self) -> String {
+        if !self.cru_state.edid_override_present {
+            if let Ok(m) = display_cru::set_displayid2_tiled_topology_override(true) {
+                self.log(m);
+            }
+        }
+        let gpu_pnp = self.hw.gpu.pnp_device_id.clone();
+        let status = match display_cru::run_cru_restart64(&gpu_pnp) {
+            Ok(m) => {
+                self.log(m);
+                "Display Driver Restarted (DisplayID 2.0 Active)".to_string()
+            }
+            Err(e) => {
+                self.log(format!("[ERROR] {e}"));
+                "DisplayID 2.0 Saved (Reboot to Apply)".to_string()
+            }
+        };
+        self.cru_state = display_cru::DisplayCruState::refresh();
+        status
+    }
+
     /// Polls any active background worker thread and advances progress animation smoothly at 60 FPS.
     fn poll_background_job(&mut self, ctx: &Context) {
         let mut finished_payload: Option<(String, Vec<String>, Box<RefreshedStates>)> = None;
@@ -3514,11 +3546,15 @@ impl LeagueUnlaggedApp {
                 }
             }
 
-            // Smooth exponential interpolation + gentle time-based creep so progress never looks stalled
-            let elapsed_s = job.started_at.elapsed().as_secs_f32();
-            let auto_target = (job.target_progress + (elapsed_s * 0.18).min(0.22)).min(0.94);
-            let diff = auto_target - job.visual_progress;
-            job.visual_progress += diff * 0.16;
+            if !job.is_finished {
+                // Smooth exponential interpolation + gentle time-based creep so progress never looks stalled
+                let elapsed_s = job.started_at.elapsed().as_secs_f32();
+                let auto_target = (job.target_progress + (elapsed_s * 0.18).min(0.22)).min(0.94);
+                let diff = auto_target - job.visual_progress;
+                job.visual_progress += diff * 0.16;
+            } else {
+                job.visual_progress = 1.0;
+            }
         }
 
         if let Some((title, logs, states)) = finished_payload {
@@ -3531,24 +3567,58 @@ impl LeagueUnlaggedApp {
             for line in logs {
                 self.log(line);
             }
-            self.active_job = None;
-            self.completion_toast = Some((Instant::now(), format!("{title} — Applied")));
+
+            let keep_modal_for_driver = self
+                .active_job
+                .as_ref()
+                .map(|j| j.show_driver_restart_action)
+                .unwrap_or(false);
+
+            if keep_modal_for_driver {
+                let queued = self
+                    .active_job
+                    .as_ref()
+                    .map(|j| j.driver_restart_queued)
+                    .unwrap_or(false);
+                let auto_status = if queued {
+                    Some(self.execute_modal_display_driver_restart())
+                } else {
+                    None
+                };
+                if let Some(job) = &mut self.active_job {
+                    job.is_finished = true;
+                    job.target_progress = 1.0;
+                    job.visual_progress = 1.0;
+                    job.step_label =
+                        "All optimizations applied. Restart display driver to activate CRU DisplayID 2.0 & GPU changes."
+                            .to_string();
+                    if let Some(st) = auto_status {
+                        job.driver_restarted_status = Some(st);
+                    }
+                }
+            } else {
+                self.active_job = None;
+                self.completion_toast = Some((Instant::now(), format!("{title} — Applied")));
+            }
             ctx.request_repaint();
         }
     }
 
     /// Renders a 60 FPS animated vector progress modal while a background tweak task is running,
-    /// plus a non-intrusive completion toast when finished.
+    /// including an inline CRU / DisplayID 2.0 Display Driver Restart button during 1-Click Optimization.
     fn render_active_job_overlay(&mut self, ctx: &Context) {
         let p = self.theme_mode.palette();
         let screen_rect = ctx.screen_rect();
+
+        let mut click_restart_driver = false;
+        let mut click_close_modal = false;
 
         if let Some(job) = &self.active_job {
             ctx.request_repaint();
             let time = ctx.input(|i| i.time) as f32;
 
             let overlay_layer = egui::LayerId::new(
-                egui::Order::Foreground,
+                egui::Order::Middle,
                 egui::Id::new("zen_active_job_backdrop"),
             );
             let backdrop_col = match self.theme_mode {
@@ -3558,9 +3628,12 @@ impl LeagueUnlaggedApp {
             let painter = ctx.layer_painter(overlay_layer);
             painter.rect_filled(screen_rect, Rounding::ZERO, backdrop_col);
 
-            let card_w = 450.0_f32.min(screen_rect.width() - 40.0);
-            let card_h = 132.0_f32;
-            let card_rect = egui::Rect::from_center_size(screen_rect.center(), Vec2::new(card_w, card_h));
+            let has_driver_bar = job.show_driver_restart_action;
+            let card_w = if has_driver_bar { 520.0_f32 } else { 450.0_f32 }
+                .min(screen_rect.width() - 40.0);
+            let card_h = if has_driver_bar { 188.0_f32 } else { 132.0_f32 };
+            let card_rect =
+                egui::Rect::from_center_size(screen_rect.center(), Vec2::new(card_w, card_h));
 
             // Soft drop shadow + elevated card surface
             painter.rect_filled(
@@ -3572,85 +3645,136 @@ impl LeagueUnlaggedApp {
                 card_rect,
                 Rounding::same(14.0),
                 p.elevated_modal,
-                Stroke::new(1.5_f32, p.border_selected),
+                Stroke::new(
+                    1.5_f32,
+                    if job.is_finished {
+                        p.emerald_optimal
+                    } else {
+                        p.border_selected
+                    },
+                ),
             );
 
-            // Animated dual-arc vector spinner on the left
-            let spinner_center = pos2(card_rect.left() + 42.0, card_rect.top() + 48.0);
+            // Animated dual-arc vector spinner (or Emerald Checkmark when finished at 100%)
+            let spinner_center = pos2(card_rect.left() + 42.0, card_rect.top() + 46.0);
             let spinner_radius = 15.5_f32;
-            painter.circle_stroke(
-                spinner_center,
-                spinner_radius,
-                Stroke::new(2.2_f32, p.border_subtle),
-            );
+            if job.is_finished {
+                painter.circle_filled(
+                    spinner_center,
+                    spinner_radius,
+                    p.emerald_optimal.gamma_multiply(0.16),
+                );
+                painter.circle_stroke(
+                    spinner_center,
+                    spinner_radius,
+                    Stroke::new(2.0_f32, p.emerald_optimal),
+                );
+                let ck = Stroke::new(2.4_f32, p.emerald_optimal);
+                painter.line_segment(
+                    [
+                        pos2(spinner_center.x - 5.0, spinner_center.y + 0.5),
+                        pos2(spinner_center.x - 1.2, spinner_center.y + 4.2),
+                    ],
+                    ck,
+                );
+                painter.line_segment(
+                    [
+                        pos2(spinner_center.x - 1.2, spinner_center.y + 4.2),
+                        pos2(spinner_center.x + 5.8, spinner_center.y - 3.6),
+                    ],
+                    ck,
+                );
+            } else {
+                painter.circle_stroke(
+                    spinner_center,
+                    spinner_radius,
+                    Stroke::new(2.2_f32, p.border_subtle),
+                );
 
-            let segs = 20usize;
-            let start_angle = time * 4.4;
-            let sweep = std::f32::consts::TAU * 0.62;
-            let pts: Vec<egui::Pos2> = (0..=segs)
-                .map(|i| {
-                    let a = start_angle + sweep * (i as f32 / segs as f32);
-                    pos2(
-                        spinner_center.x + spinner_radius * a.cos(),
-                        spinner_center.y + spinner_radius * a.sin(),
-                    )
-                })
-                .collect();
-            for pair in pts.windows(2) {
-                painter.line_segment([pair[0], pair[1]], Stroke::new(2.8_f32, p.gold_priority));
+                let segs = 20usize;
+                let start_angle = time * 4.4;
+                let sweep = std::f32::consts::TAU * 0.62;
+                let pts: Vec<egui::Pos2> = (0..=segs)
+                    .map(|i| {
+                        let a = start_angle + sweep * (i as f32 / segs as f32);
+                        pos2(
+                            spinner_center.x + spinner_radius * a.cos(),
+                            spinner_center.y + spinner_radius * a.sin(),
+                        )
+                    })
+                    .collect();
+                for pair in pts.windows(2) {
+                    painter.line_segment([pair[0], pair[1]], Stroke::new(2.8_f32, p.gold_priority));
+                }
+                let inner_angle = -time * 3.2;
+                let dot_pos = pos2(
+                    spinner_center.x + (spinner_radius * 0.52) * inner_angle.cos(),
+                    spinner_center.y + (spinner_radius * 0.52) * inner_angle.sin(),
+                );
+                painter.circle_filled(dot_pos, 3.0, p.emerald_optimal);
             }
-            // Inner counter-rotating orbital dot
-            let inner_angle = -time * 3.2;
-            let dot_pos = pos2(
-                spinner_center.x + (spinner_radius * 0.52) * inner_angle.cos(),
-                spinner_center.y + (spinner_radius * 0.52) * inner_angle.sin(),
-            );
-            painter.circle_filled(dot_pos, 3.0, p.emerald_optimal);
 
             // Title & live percentage
             let text_left = card_rect.left() + 74.0;
+            let display_title = if job.is_finished {
+                "1-Click Optimization Complete".to_string()
+            } else {
+                job.title.clone()
+            };
             let title_galley = painter.layout_no_wrap(
-                job.title.clone(),
+                display_title,
                 egui::FontId::new(14.5, egui::FontFamily::Proportional),
                 p.text_heading,
             );
             painter.galley(
-                pos2(text_left, card_rect.top() + 26.0),
+                pos2(text_left, card_rect.top() + 24.0),
                 title_galley,
                 p.text_heading,
             );
 
-            let pct_str = format!("{:.0}%", (job.visual_progress * 100.0).clamp(6.0, 99.0));
+            let pct_val = if job.is_finished {
+                100.0
+            } else {
+                (job.visual_progress * 100.0).clamp(6.0, 99.0)
+            };
+            let pct_col = if job.is_finished {
+                p.emerald_optimal
+            } else {
+                p.gold_priority
+            };
+            let pct_str = format!("{pct_val:.0}%");
             let pct_galley = painter.layout_no_wrap(
                 pct_str,
                 egui::FontId::new(12.5, egui::FontFamily::Monospace),
-                p.gold_priority,
+                pct_col,
             );
             painter.galley(
                 pos2(
                     card_rect.right() - 24.0 - pct_galley.size().x,
-                    card_rect.top() + 28.0,
+                    card_rect.top() + 26.0,
                 ),
                 pct_galley,
-                p.gold_priority,
+                pct_col,
             );
 
             // Step description
-            let step_galley = painter.layout_no_wrap(
+            let step_galley = painter.layout(
                 job.step_label.clone(),
-                egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                egui::FontId::new(11.8, egui::FontFamily::Proportional),
                 p.text_secondary,
+                card_w - 98.0,
             );
             painter.galley(
-                pos2(text_left, card_rect.top() + 50.0),
+                pos2(text_left, card_rect.top() + 48.0),
                 step_galley,
                 p.text_secondary,
             );
 
             // Animated progress bar track & shimmer fill
+            let bar_top = card_rect.top() + 92.0;
             let bar_rect = egui::Rect::from_min_max(
-                pos2(card_rect.left() + 24.0, card_rect.bottom() - 32.0),
-                pos2(card_rect.right() - 24.0, card_rect.bottom() - 22.0),
+                pos2(card_rect.left() + 24.0, bar_top),
+                pos2(card_rect.right() - 24.0, bar_top + 10.0),
             );
             painter.rect_filled(bar_rect, Rounding::same(5.0), p.subtle_glass_panel);
 
@@ -3659,21 +3783,99 @@ impl LeagueUnlaggedApp {
                 bar_rect.min,
                 pos2(bar_rect.left() + fill_w, bar_rect.bottom()),
             );
-            painter.rect_filled(fill_rect, Rounding::same(5.0), p.border_selected);
+            let bar_col = if job.is_finished {
+                p.emerald_optimal
+            } else {
+                p.border_selected
+            };
+            painter.rect_filled(fill_rect, Rounding::same(5.0), bar_col);
 
-            // Travelling highlight pulse along the active progress bar
-            let shimmer_phase = (time * 1.4).fract();
-            let shimmer_w = (fill_w * 0.35).clamp(16.0, 80.0);
-            let shimmer_x = fill_rect.left() + (fill_w - shimmer_w) * shimmer_phase;
-            let shimmer_rect = egui::Rect::from_min_max(
-                pos2(shimmer_x, fill_rect.top()),
-                pos2((shimmer_x + shimmer_w).min(fill_rect.right()), fill_rect.bottom()),
-            );
-            painter.rect_filled(
-                shimmer_rect,
-                Rounding::same(5.0),
-                egui::Color32::from_white_alpha(65),
-            );
+            if !job.is_finished {
+                let shimmer_phase = (time * 1.4).fract();
+                let shimmer_w = (fill_w * 0.35).clamp(16.0, 80.0);
+                let shimmer_x = fill_rect.left() + (fill_w - shimmer_w) * shimmer_phase;
+                let shimmer_rect = egui::Rect::from_min_max(
+                    pos2(shimmer_x, fill_rect.top()),
+                    pos2((shimmer_x + shimmer_w).min(fill_rect.right()), fill_rect.bottom()),
+                );
+                painter.rect_filled(
+                    shimmer_rect,
+                    Rounding::same(5.0),
+                    egui::Color32::from_white_alpha(65),
+                );
+            }
+
+            // Inline CRU / DisplayID 2.0 Display Driver Restart Action Row inside the progress modal
+            if has_driver_bar {
+                let div_y = card_rect.top() + 120.0;
+                painter.line_segment(
+                    [
+                        pos2(card_rect.left() + 20.0, div_y),
+                        pos2(card_rect.right() - 20.0, div_y),
+                    ],
+                    Stroke::new(1.0_f32, p.border_subtle),
+                );
+
+                let action_rect = egui::Rect::from_min_max(
+                    pos2(card_rect.left() + 22.0, div_y + 12.0),
+                    pos2(card_rect.right() - 22.0, card_rect.bottom() - 12.0),
+                );
+                let is_done = job.is_finished;
+                let is_queued = job.driver_restart_queued;
+                let restarted_status = job.driver_restarted_status.clone();
+
+                egui::Area::new(egui::Id::new("zen_active_job_driver_action_area"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(action_rect.min)
+                    .show(ctx, |ui| {
+                        ui.set_min_size(action_rect.size());
+                        ui.set_max_size(action_rect.size());
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            draw_lucide_icon(ui, LucideIcon::Monitor, 15.0, p.text_heading);
+                            let left_note = if let Some(st) = &restarted_status {
+                                st.as_str()
+                            } else {
+                                "CRU / DisplayID 2.0 Block:"
+                            };
+                            ui.label(
+                                RichText::new(left_note)
+                                    .size(11.8)
+                                    .strong()
+                                    .color(if restarted_status.is_some() {
+                                        p.emerald_optimal
+                                    } else {
+                                        p.text_body
+                                    }),
+                            );
+
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                if is_done {
+                                    if zen_pill_button(ui, self.theme_mode, "Close", false).clicked()
+                                    {
+                                        click_close_modal = true;
+                                    }
+                                }
+
+                                let (btn_icon, btn_label) = if restarted_status.is_some() {
+                                    (LucideIcon::Check, "Restart Display Driver Again")
+                                } else if is_queued && !is_done {
+                                    (LucideIcon::RotateCcw, "Driver Restart Queued (100%)")
+                                } else {
+                                    (LucideIcon::RotateCcw, "Restart Display Driver (CRU)")
+                                };
+
+                                if zen_cta_button(ui, self.theme_mode, Some(btn_icon), btn_label)
+                                    .on_hover_text("Applies the VESA DisplayID 2.0 (CRU 1x1 Tiled Topology) block and immediately restarts the display driver via restart64 / pnputil.")
+                                    .clicked()
+                                {
+                                    click_restart_driver = true;
+                                }
+                            });
+                        });
+                    });
+            }
         } else if let Some((when, msg)) = &self.completion_toast {
             let elapsed = when.elapsed().as_secs_f32();
             if elapsed < 1.8 {
@@ -3719,6 +3921,28 @@ impl LeagueUnlaggedApp {
                 );
             } else {
                 self.completion_toast = None;
+            }
+        }
+
+        if click_restart_driver {
+            let is_done = self
+                .active_job
+                .as_ref()
+                .map(|j| j.is_finished)
+                .unwrap_or(false);
+            if is_done {
+                let st = self.execute_modal_display_driver_restart();
+                if let Some(job) = &mut self.active_job {
+                    job.driver_restarted_status = Some(st);
+                }
+            } else if let Some(job) = &mut self.active_job {
+                job.driver_restart_queued = true;
+            }
+        }
+
+        if click_close_modal {
+            if let Some(job) = self.active_job.take() {
+                self.completion_toast = Some((Instant::now(), format!("{} — Applied", job.title)));
             }
         }
     }
