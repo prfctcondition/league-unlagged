@@ -147,10 +147,11 @@ Instead of guessing your hardware, **League Unlagged queries the Windows kernel 
 
 ## ⚙ Installation
 
-### Prebuilt Windows Release (Recommended)
-1. Download the latest release from the [Releases page](https://github.com/prfctcondition/league-unlagged/releases/latest):
-   - **`league-unlagged.exe`**
-2. Right-click **`league-unlagged.exe`** and select **Run as administrator** (required for `HKLM` PCI interrupt configuration, `powercfg`, and Process Lasso profile injection).
+### Windows Installer (Recommended)
+1. Download the latest installer from the [Releases page](https://github.com/prfctcondition/league-unlagged/releases/latest):
+   - **`League-Unlagged-Windows-installer.exe`** *(Official Setup Wizard — automatically creates a Desktop & Start Menu shortcut pre-configured to **Run as Administrator**)*
+   - **`league-unlagged.exe`** *(Standalone Portable Binary)*
+2. Run **`League-Unlagged-Windows-installer.exe`**, click **Install**, and launch **League Unlagged** directly from your Desktop shortcut.
 3. Complete the 2-step **Setup Wizard** on first launch to create a Windows System Restore Point and verify your `League of Legends` directory.
 
 ---

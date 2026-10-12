@@ -1,0 +1,6 @@
+/target/
+/backup_original_state.json
+/ui_preferences.json
+/tools/cru/*.exe
+/tools/cru/*.zip
+*.pdb
