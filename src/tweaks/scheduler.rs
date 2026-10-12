@@ -44,6 +44,7 @@ extern "system" {
 const SET_TIMER_RESOLUTION_SERVICE_CS: &str = r#"using System;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
+using System.Threading;
 
 public class SetTimerResolutionService : ServiceBase
 {
@@ -115,7 +116,22 @@ public class SetTimerResolutionService : ServiceBase
                 res = parsed;
             }
         }
-        ServiceBase.Run(new SetTimerResolutionService(res));
+        if (!Environment.UserInteractive)
+        {
+            ServiceBase.Run(new SetTimerResolutionService(res));
+        }
+        else
+        {
+            bool createdNew;
+            using (Mutex m = new Mutex(true, "Local\\SetTimerResolutionAutorunMutex", out createdNew))
+            {
+                if (!createdNew) return;
+                DisablePowerThrottling();
+                uint cur;
+                NtSetTimerResolution(res, true, out cur);
+                Thread.Sleep(Timeout.Infinite);
+            }
+        }
     }
 }
 "#;
@@ -136,7 +152,7 @@ pub fn disable_timer_resolution_throttling() {
     }
 }
 
-/// Checks if the standalone Windows Service `SetTimerResolutionService` is installed and running.
+/// Checks if the standalone Windows Service `SetTimerResolutionService` or Startup entry is active.
 pub fn is_timer_service_running() -> bool {
     if let Ok(out) = Command::new("sc.exe")
         .args(["query", "SetTimerResolutionService"])
@@ -144,7 +160,19 @@ pub fn is_timer_service_running() -> bool {
         .output()
     {
         let stdout = String::from_utf8_lossy(&out.stdout);
-        return stdout.contains("RUNNING") || stdout.contains(": 4 ");
+        if stdout.contains("RUNNING") || stdout.contains(": 4 ") {
+            return true;
+        }
+    }
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(run_key) =
+        hkcu.open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_READ)
+    {
+        if let Ok(val) = run_key.get_value::<String, _>("SetTimerResolutionService") {
+            if !val.trim().is_empty() {
+                return true;
+            }
+        }
     }
     false
 }
@@ -193,10 +221,11 @@ pub fn query_current_timer_resolution_100ns() -> u32 {
     }
 }
 
-/// Installs and starts (or stops and removes) the standalone Windows Service `SetTimerResolutionService`
-/// (`C:\ProgramData\LeagueUnlagged\TimerService\SetTimerResolutionService.exe`) so that the 0.505 ms
-/// kernel timer resolution remains active across reboots at the OS service level without needing
-/// League Unlagged running or installed.
+/// Installs and starts (or stops and removes) the standalone `SetTimerResolutionService`
+/// (`C:\ProgramData\LeagueUnlagged\TimerService\SetTimerResolutionService.exe`) as BOTH:
+/// 1) A Windows System Service (`start= auto` in `services.msc`), and
+/// 2) A Windows Startup entry (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SetTimerResolutionService`),
+/// so the 0.505 ms kernel timer resolution persists across reboots without needing League Unlagged.
 pub fn set_kernel_timer_resolution(enable: bool, desired_100ns: u32) -> Result<String, String> {
     if !is_running_as_admin() {
         return Err(
@@ -206,6 +235,7 @@ pub fn set_kernel_timer_resolution(enable: bool, desired_100ns: u32) -> Result<S
     }
 
     disable_timer_resolution_throttling();
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
     if enable {
         let _ = crate::tweaks::windows_reg::set_global_timer_resolution_requests(true);
@@ -224,32 +254,34 @@ pub fn set_kernel_timer_resolution(enable: bool, desired_100ns: u32) -> Result<S
             .args(["delete", "SetTimerResolutionService"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
+        let _ = Command::new("taskkill.exe")
+            .args(["/F", "/IM", "SetTimerResolutionService.exe"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
 
-        if !exe_path.exists() {
-            fs::write(&cs_path, SET_TIMER_RESOLUTION_SERVICE_CS)
-                .map_err(|e| format!("Failed to write SetTimerResolutionService.cs: {e}"))?;
-            let csc = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe";
-            let out_arg = format!("/out:{}", exe_path.display());
-            let compile = Command::new(csc)
-                .args([
-                    "/nologo",
-                    "/optimize+",
-                    "/target:exe",
-                    "/r:System.ServiceProcess.dll",
-                    &out_arg,
-                    &cs_path.display().to_string(),
-                ])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .map_err(|e| format!("Failed to invoke csc.exe to build SetTimerResolutionService.exe: {e}"))?;
-            if !compile.status.success() || !exe_path.exists() {
-                return Err(format!(
-                    "Failed to build SetTimerResolutionService.exe: {}",
-                    String::from_utf8_lossy(&compile.stdout).trim()
-                ));
-            }
-            let _ = fs::remove_file(&cs_path);
+        fs::write(&cs_path, SET_TIMER_RESOLUTION_SERVICE_CS)
+            .map_err(|e| format!("Failed to write SetTimerResolutionService.cs: {e}"))?;
+        let csc = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe";
+        let out_arg = format!("/out:{}", exe_path.display());
+        let compile = Command::new(csc)
+            .args([
+                "/nologo",
+                "/optimize+",
+                "/target:winexe",
+                "/r:System.ServiceProcess.dll",
+                &out_arg,
+                &cs_path.display().to_string(),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Failed to invoke csc.exe to build SetTimerResolutionService.exe: {e}"))?;
+        if !compile.status.success() || !exe_path.exists() {
+            return Err(format!(
+                "Failed to build SetTimerResolutionService.exe: {}",
+                String::from_utf8_lossy(&compile.stdout).trim()
+            ));
         }
+        let _ = fs::remove_file(&cs_path);
 
         let bin_path = format!("{} {}", exe_path.display(), desired_100ns);
         let _ = Command::new("sc.exe")
@@ -271,6 +303,18 @@ pub fn set_kernel_timer_resolution(enable: bool, desired_100ns: u32) -> Result<S
             .creation_flags(CREATE_NO_WINDOW)
             .output();
 
+        if let Ok((run_key, _)) =
+            hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        {
+            let run_val = format!("\"{}\" {}", exe_path.display(), desired_100ns);
+            let _ = run_key.set_value("SetTimerResolutionService", &run_val);
+        }
+
+        let _ = Command::new(&exe_path)
+            .arg(desired_100ns.to_string())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+
         unsafe {
             let mut cur = 0u32;
             let _ = NtSetTimerResolution(desired_100ns, 1, &mut cur);
@@ -278,7 +322,7 @@ pub fn set_kernel_timer_resolution(enable: bool, desired_100ns: u32) -> Result<S
 
         let effective_cur = query_current_timer_resolution_100ns();
         Ok(format!(
-            "SetTimerResolutionService (Windows Service start=auto) installed & started -> {:.3} ms ({} * 100ns)",
+            "SetTimerResolutionService (Windows Service AUTO_START + Startup Autorun) active -> {:.3} ms ({} * 100ns)",
             effective_cur as f64 / 10_000.0,
             effective_cur
         ))
@@ -291,6 +335,16 @@ pub fn set_kernel_timer_resolution(enable: bool, desired_100ns: u32) -> Result<S
             .args(["delete", "SetTimerResolutionService"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
+        let _ = Command::new("taskkill.exe")
+            .args(["/F", "/IM", "SetTimerResolutionService.exe"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+
+        if let Ok((run_key, _)) =
+            hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        {
+            let _ = run_key.delete_value("SetTimerResolutionService");
+        }
 
         unsafe {
             let mut cur = 0u32;
@@ -299,7 +353,7 @@ pub fn set_kernel_timer_resolution(enable: bool, desired_100ns: u32) -> Result<S
 
         let effective_cur = query_current_timer_resolution_100ns();
         Ok(format!(
-            "SetTimerResolutionService stopped & removed -> Restored to OS Default ({:.3} ms)",
+            "SetTimerResolutionService stopped & removed from Startup -> Restored to OS Default ({:.3} ms)",
             effective_cur as f64 / 10_000.0
         ))
     }
