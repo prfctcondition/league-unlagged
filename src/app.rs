@@ -217,7 +217,7 @@ impl Default for OneClickConfig {
             interrupt_affinity: true,
             network_stack: true,
             gpu_driver_tweaks: true,
-            timer_resolution_505: true,
+            timer_resolution_505: false,
             displayid_topology_override: true,
         }
     }
@@ -321,10 +321,6 @@ impl LeagueUnlaggedApp {
             hw.league_exe_paths.insert(0, custom_game_exe);
         }
 
-        if scheduler::is_timer_daemon_enabled() {
-            let _ = scheduler::set_kernel_timer_resolution(true, 5050);
-        }
-
         let win_state = windows_reg::WindowsRegState::refresh(&hw.league_exe_paths);
         let sched_state = scheduler::SchedulerState::refresh(&hw.cpu_plan);
         let irq_state = interrupts::InterruptsState::refresh(&hw);
@@ -337,7 +333,7 @@ impl LeagueUnlaggedApp {
             &net_state,
             &gpu_state,
         );
-        let timer_505_enabled = scheduler::is_timer_daemon_enabled()
+        let timer_505_enabled = scheduler::is_timer_service_running()
             || sched_state.current_timer_resolution_100ns <= 5500;
 
         let mut logs = Vec::new();
@@ -876,7 +872,7 @@ impl LeagueUnlaggedApp {
                             .color(p.text_heading),
                     );
                     ui.label(
-                        RichText::new("| DisplayID 2.0 Tiled Topology Override is opt-in by default")
+                        RichText::new("| Kernel Timer (0.505 ms) is opt-in by default")
                             .size(11.5)
                             .color(p.text_muted),
                     );
@@ -924,11 +920,11 @@ impl LeagueUnlaggedApp {
                     );
                     ui.checkbox(
                         &mut self.one_click_cfg.timer_resolution_505,
-                        RichText::new("0.505 ms Kernel Timer + Disable Dynamic Tick").size(12.0).color(p.text_body),
+                        RichText::new("0.505 ms Kernel Timer + Disable Dynamic Tick (Optional)").size(12.0).color(p.gold_priority),
                     );
                     ui.checkbox(
                         &mut self.one_click_cfg.displayid_topology_override,
-                        RichText::new("DisplayID 2.0 Tiled Topology Override (Optional)").size(12.0).color(p.gold_priority),
+                        RichText::new("DisplayID 2.0 Tiled Topology Override").size(12.0).color(p.text_body),
                     );
                 });
             });
@@ -2980,7 +2976,7 @@ impl LeagueUnlaggedApp {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(
-                            "Locks a persistent 0.505 ms (0.500 ms hardware) system timer quantum via NtSetTimerResolution and a built-in zero-CPU background holder daemon (--timer-daemon 5050) with Windows 11 Power Throttling disabled. No external program required.",
+                            "Installs and starts the standalone Windows Service 'SetTimerResolutionService' (start=auto in services.msc) to lock a 0.505 ms system timer quantum across reboots even after closing or uninstalling League Unlagged (manual opt-in; excluded from default 1-Click profile).",
                         )
                         .size(12.0)
                         .color(p.text_secondary),
@@ -3581,7 +3577,7 @@ impl LeagueUnlaggedApp {
             self.net_state = states.net_state;
             self.gpu_state = states.gpu_state;
             self.cru_state = states.cru_state;
-            self.timer_505_enabled = scheduler::is_timer_daemon_enabled()
+            self.timer_505_enabled = scheduler::is_timer_service_running()
                 || self.sched_state.current_timer_resolution_100ns <= 5500;
             for line in logs {
                 self.log(line);

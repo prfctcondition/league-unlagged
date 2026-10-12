@@ -11,14 +11,6 @@ use app::LeagueUnlaggedApp;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if let Some(pos) = args.iter().position(|a| a == "--timer-daemon") {
-        let desired_100ns = args
-            .get(pos + 1)
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(5050);
-        tweaks::scheduler::run_timer_daemon_loop(desired_100ns);
-        return Ok(());
-    }
     if args.iter().any(|a| a == "--cli-report") {
         let hw = hardware::SystemHardwareReport::scan_system();
         let win = tweaks::windows_reg::WindowsRegState::refresh(&hw.league_exe_paths);

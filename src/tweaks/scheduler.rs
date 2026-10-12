@@ -41,9 +41,85 @@ extern "system" {
     ) -> i32;
 }
 
-/// Disables Windows 11 `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` (0x4) and EcoQoS (0x1)
-/// on the current process so the Windows 11 kernel always honors `NtSetTimerResolution` even when
-/// minimized or running as a background daemon.
+const SET_TIMER_RESOLUTION_SERVICE_CS: &str = r#"using System;
+using System.Runtime.InteropServices;
+using System.ServiceProcess;
+
+public class SetTimerResolutionService : ServiceBase
+{
+    [DllImport("ntdll.dll", SetLastError = true)]
+    private static extern int NtQueryTimerResolution(out uint minimumResolution, out uint maximumResolution, out uint currentResolution);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    private static extern int NtSetTimerResolution(uint desiredResolution, bool setResolution, out uint currentResolution);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetProcessInformation(IntPtr hProcess, int processInformationClass, ref PROCESS_POWER_THROTTLING_STATE processInformation, uint processInformationSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_POWER_THROTTLING_STATE
+    {
+        public uint Version;
+        public uint ControlMask;
+        public uint StateMask;
+    }
+
+    private uint targetResolution = 5050;
+
+    public SetTimerResolutionService(uint res)
+    {
+        this.ServiceName = "SetTimerResolutionService";
+        this.CanStop = true;
+        this.CanPauseAndContinue = false;
+        this.AutoLog = false;
+        this.targetResolution = res;
+    }
+
+    private static void DisablePowerThrottling()
+    {
+        try
+        {
+            PROCESS_POWER_THROTTLING_STATE state = new PROCESS_POWER_THROTTLING_STATE();
+            state.Version = 1;
+            state.ControlMask = 0x5;
+            state.StateMask = 0;
+            SetProcessInformation(GetCurrentProcess(), 4, ref state, (uint)Marshal.SizeOf(state));
+        }
+        catch { }
+    }
+
+    protected override void OnStart(string[] args)
+    {
+        DisablePowerThrottling();
+        uint cur;
+        NtSetTimerResolution(this.targetResolution, true, out cur);
+    }
+
+    protected override void OnStop()
+    {
+        uint cur;
+        NtSetTimerResolution(this.targetResolution, false, out cur);
+    }
+
+    public static void Main(string[] args)
+    {
+        uint res = 5050;
+        if (args != null && args.Length > 0)
+        {
+            uint parsed;
+            if (uint.TryParse(args[0], out parsed) && parsed >= 5000 && parsed <= 156250)
+            {
+                res = parsed;
+            }
+        }
+        ServiceBase.Run(new SetTimerResolutionService(res));
+    }
+}
+"#;
+
 pub fn disable_timer_resolution_throttling() {
     unsafe {
         let state = ProcessPowerThrottlingState {
@@ -53,24 +129,22 @@ pub fn disable_timer_resolution_throttling() {
         };
         let _ = SetProcessInformation(
             GetCurrentProcess(),
-            4, // ProcessPowerThrottling
+            4,
             &state as *const _ as *const std::ffi::c_void,
             std::mem::size_of::<ProcessPowerThrottlingState>() as u32,
         );
     }
 }
 
-pub fn is_timer_daemon_enabled() -> bool {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    if let Ok(run_key) = hkcu.open_subkey_with_flags(
-        r"Software\Microsoft\Windows\CurrentVersion\Run",
-        KEY_READ,
-    ) {
-        if let Ok(val) = run_key.get_value::<String, _>("LeagueUnlaggedTimerDaemon") {
-            if !val.trim().is_empty() {
-                return true;
-            }
-        }
+/// Checks if the standalone Windows Service `SetTimerResolutionService` is installed and running.
+pub fn is_timer_service_running() -> bool {
+    if let Ok(out) = Command::new("sc.exe")
+        .args(["query", "SetTimerResolutionService"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return stdout.contains("RUNNING") || stdout.contains(": 4 ");
     }
     false
 }
@@ -95,14 +169,6 @@ impl SchedulerState {
         let ifeo_priorities_applied = check_ifeo_priorities_applied();
         let process_lasso_installed = is_process_lasso_installed();
         let process_lasso_rules_applied = check_process_lasso_rules_applied(plan);
-
-        if is_timer_daemon_enabled() {
-            disable_timer_resolution_throttling();
-            unsafe {
-                let mut cur = 0u32;
-                let _ = NtSetTimerResolution(5050, 1, &mut cur);
-            }
-        }
         let current_timer_resolution_100ns = query_current_timer_resolution_100ns();
 
         Self {
@@ -127,114 +193,115 @@ pub fn query_current_timer_resolution_100ns() -> u32 {
     }
 }
 
-/// Runs the built-in zero-CPU background timer holder (`league-unlagged.exe --timer-daemon <100ns>`).
-/// Holds `NtSetTimerResolution` open in the background even when the main GUI is closed, until
-/// signaled via `Local\LeagueUnlagged_TimerDaemon_Stop_v1`.
-pub fn run_timer_daemon_loop(desired_100ns: u32) {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
-    use windows_sys::Win32::System::Threading::{
-        CreateEventW, CreateMutexW, ResetEvent, WaitForSingleObject, INFINITE,
-    };
-
-    let mutex_name: Vec<u16> = "Local\\LeagueUnlagged_TimerDaemon_Mutex_v1\0"
-        .encode_utf16()
-        .collect();
-    let mutex_handle = unsafe { CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr()) };
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        return;
-    }
-
-    let event_name: Vec<u16> = "Local\\LeagueUnlagged_TimerDaemon_Stop_v1\0"
-        .encode_utf16()
-        .collect();
-    let stop_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, event_name.as_ptr()) };
-    if !stop_event.is_null() {
-        unsafe {
-            ResetEvent(stop_event);
-        }
-    }
-
-    disable_timer_resolution_throttling();
-    unsafe {
-        let mut cur = 0u32;
-        let _ = NtSetTimerResolution(desired_100ns, 1, &mut cur);
-    }
-
-    if !stop_event.is_null() {
-        unsafe {
-            WaitForSingleObject(stop_event, INFINITE);
-            CloseHandle(stop_event);
-        }
-    }
-
-    unsafe {
-        let mut cur = 0u32;
-        let _ = NtSetTimerResolution(desired_100ns, 0, &mut cur);
-        if !mutex_handle.is_null() {
-            CloseHandle(mutex_handle);
-        }
-    }
-}
-
-/// Sets the Windows kernel timer resolution via `ntdll!NtSetTimerResolution`, disables Windows 11
-/// `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION`, and manages the persistent zero-CPU
-/// background daemon (`--timer-daemon`) so the 0.5ms quantum stays locked even after closing the GUI.
+/// Installs and starts (or stops and removes) the standalone Windows Service `SetTimerResolutionService`
+/// (`C:\ProgramData\LeagueUnlagged\TimerService\SetTimerResolutionService.exe`) so that the 0.505 ms
+/// kernel timer resolution remains active across reboots at the OS service level without needing
+/// League Unlagged running or installed.
 pub fn set_kernel_timer_resolution(enable: bool, desired_100ns: u32) -> Result<String, String> {
+    if !is_running_as_admin() {
+        return Err(
+            "Administrator privileges are required to install or remove SetTimerResolutionService."
+                .to_string(),
+        );
+    }
+
     disable_timer_resolution_throttling();
 
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if enable {
         let _ = crate::tweaks::windows_reg::set_global_timer_resolution_requests(true);
-        if let Ok(exe) = std::env::current_exe() {
-            if let Ok((run_key, _)) =
-                hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-            {
-                let cmd_val = format!("\"{}\" --timer-daemon {}", exe.display(), desired_100ns);
-                let _ = run_key.set_value("LeagueUnlaggedTimerDaemon", &cmd_val);
-            }
-            let _ = Command::new(&exe)
-                .args(["--timer-daemon", &desired_100ns.to_string()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn();
-        }
-    } else {
-        if let Ok((run_key, _)) =
-            hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-        {
-            let _ = run_key.delete_value("LeagueUnlaggedTimerDaemon");
-        }
-        unsafe {
-            let event_name: Vec<u16> = "Local\\LeagueUnlagged_TimerDaemon_Stop_v1\0"
-                .encode_utf16()
-                .collect();
-            let ev = windows_sys::Win32::System::Threading::CreateEventW(
-                std::ptr::null(),
-                1,
-                0,
-                event_name.as_ptr(),
-            );
-            if !ev.is_null() {
-                windows_sys::Win32::System::Threading::SetEvent(ev);
-                windows_sys::Win32::Foundation::CloseHandle(ev);
-            }
-        }
-    }
 
-    unsafe {
-        let mut current = 0u32;
-        let status = NtSetTimerResolution(desired_100ns, if enable { 1 } else { 0 }, &mut current);
-        if status == 0 {
-            let effective_cur = query_current_timer_resolution_100ns();
-            Ok(format!(
-                "Kernel Timer Resolution (NtSetTimerResolution + Background Daemon) -> {:.3} ms ({} * 100ns)",
-                effective_cur as f64 / 10_000.0,
-                effective_cur
-            ))
-        } else {
-            Err(format!(
-                "NtSetTimerResolution returned NTSTATUS 0x{status:08X}"
-            ))
+        let dir = PathBuf::from(r"C:\ProgramData\LeagueUnlagged\TimerService");
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create TimerService directory: {e}"))?;
+        let cs_path = dir.join("SetTimerResolutionService.cs");
+        let exe_path = dir.join("SetTimerResolutionService.exe");
+
+        let _ = Command::new("sc.exe")
+            .args(["stop", "SetTimerResolutionService"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = Command::new("sc.exe")
+            .args(["delete", "SetTimerResolutionService"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+
+        if !exe_path.exists() {
+            fs::write(&cs_path, SET_TIMER_RESOLUTION_SERVICE_CS)
+                .map_err(|e| format!("Failed to write SetTimerResolutionService.cs: {e}"))?;
+            let csc = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe";
+            let out_arg = format!("/out:{}", exe_path.display());
+            let compile = Command::new(csc)
+                .args([
+                    "/nologo",
+                    "/optimize+",
+                    "/target:exe",
+                    "/r:System.ServiceProcess.dll",
+                    &out_arg,
+                    &cs_path.display().to_string(),
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| format!("Failed to invoke csc.exe to build SetTimerResolutionService.exe: {e}"))?;
+            if !compile.status.success() || !exe_path.exists() {
+                return Err(format!(
+                    "Failed to build SetTimerResolutionService.exe: {}",
+                    String::from_utf8_lossy(&compile.stdout).trim()
+                ));
+            }
+            let _ = fs::remove_file(&cs_path);
         }
+
+        let bin_path = format!("{} {}", exe_path.display(), desired_100ns);
+        let _ = Command::new("sc.exe")
+            .args([
+                "create",
+                "SetTimerResolutionService",
+                "binPath=",
+                &bin_path,
+                "DisplayName=",
+                "Set Timer Resolution Service",
+                "start=",
+                "auto",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+
+        let _ = Command::new("sc.exe")
+            .args(["start", "SetTimerResolutionService"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+
+        unsafe {
+            let mut cur = 0u32;
+            let _ = NtSetTimerResolution(desired_100ns, 1, &mut cur);
+        }
+
+        let effective_cur = query_current_timer_resolution_100ns();
+        Ok(format!(
+            "SetTimerResolutionService (Windows Service start=auto) installed & started -> {:.3} ms ({} * 100ns)",
+            effective_cur as f64 / 10_000.0,
+            effective_cur
+        ))
+    } else {
+        let _ = Command::new("sc.exe")
+            .args(["stop", "SetTimerResolutionService"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = Command::new("sc.exe")
+            .args(["delete", "SetTimerResolutionService"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+
+        unsafe {
+            let mut cur = 0u32;
+            let _ = NtSetTimerResolution(desired_100ns, 0, &mut cur);
+        }
+
+        let effective_cur = query_current_timer_resolution_100ns();
+        Ok(format!(
+            "SetTimerResolutionService stopped & removed -> Restored to OS Default ({:.3} ms)",
+            effective_cur as f64 / 10_000.0
+        ))
     }
 }
 
