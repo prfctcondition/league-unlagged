@@ -37,6 +37,44 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    if !args.iter().any(|a| a == "--export-screenshots") {
+        let mutex_name: Vec<u16> = "Local\\LeagueUnlagged_SingleInstance_Mutex_v1\0"
+            .encode_utf16()
+            .collect();
+        let _handle = unsafe {
+            windows_sys::Win32::System::Threading::CreateMutexW(
+                std::ptr::null(),
+                1,
+                mutex_name.as_ptr(),
+            )
+        };
+        let last_err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        if last_err == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS
+            || last_err == windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED
+        {
+            let win_title: Vec<u16> =
+                "League Unlagged — Hardware-Adaptive Latency & FPS Suite\0"
+                    .encode_utf16()
+                    .collect();
+            let hwnd = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
+                    std::ptr::null(),
+                    win_title.as_ptr(),
+                )
+            };
+            if !hwnd.is_null() {
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                        hwnd,
+                        windows_sys::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+                    );
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                }
+            }
+            return Ok(());
+        }
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("League Unlagged — Hardware-Adaptive Latency & FPS Suite")
         .with_decorations(false)

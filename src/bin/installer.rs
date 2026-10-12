@@ -615,6 +615,7 @@ impl InstallerApp {
                                 ));
                                 if self.launch_after_install {
                                     let _ = launch_installed_app_as_admin(&exe_path);
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
                             }
                             Err(err) => {
@@ -1032,8 +1033,27 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    if !is_admin && !export_screenshot && !args.iter().any(|a| a == "--elevated") {
+    if ! is_admin && !export_screenshot && !args.iter().any(|a| a == "--elevated") {
         if relaunch_self_as_admin().is_ok() {
+            return Ok(());
+        }
+    }
+
+    if !export_screenshot {
+        let mutex_name: Vec<u16> = "Local\\LeagueUnlagged_Installer_SingleInstance_v1\0"
+            .encode_utf16()
+            .collect();
+        let _handle = unsafe {
+            windows_sys::Win32::System::Threading::CreateMutexW(
+                std::ptr::null(),
+                1,
+                mutex_name.as_ptr(),
+            )
+        };
+        let last_err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        if last_err == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS
+            || last_err == windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED
+        {
             return Ok(());
         }
     }
