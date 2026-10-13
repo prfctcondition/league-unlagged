@@ -95,13 +95,6 @@ Instead of guessing your hardware, **League Unlagged queries the Windows kernel 
 ---
 
 <div align="center">
-  <img src="./readme-assets/dark-showcase.png" alt="League Unlagged OLED Dark Theme Showcase" width="100%" />
-  <p><em>Monochromatic OLED Dark Theme with real-time CPU core allocation cards, interactive primary core pinning, and status telemetry.</em></p>
-</div>
-
-<br />
-
-<div align="center">
   <img src="./readme-assets/scheduler-showcase.png" alt="League Unlagged Scheduler & Vanguard Isolation" width="100%" />
   <p><em>Granular Scheduler, IFEO Kernel Priority, and automated Process Lasso profile generation for Game, Client, and Riot Vanguard.</em></p>
 </div>
